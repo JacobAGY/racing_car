@@ -1,0 +1,111 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>赛车小游戏 - 现场大屏 · 个人计时赛</title>
+<script src="/socket.io/socket.io.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/qrcode@1.5.3/build/qrcode.min.js"></script>
+<style>
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: -apple-system,"PingFang SC","Microsoft YaHei",sans-serif; background: #0b0e1a; color: #fff; overflow: hidden; }
+  #app { display: flex; height: 100vh; }
+  #left { flex: 1; display: flex; flex-direction: column; padding: 20px 24px; }
+  #right { width: 360px; background: rgba(255,255,255,.05); padding: 20px; display: flex; flex-direction: column; }
+  h1 { margin: 0 0 4px; font-size: 32px; }
+  .meta { opacity: .7; font-size: 15px; margin-bottom: 10px; }
+  #main { flex: 1; display: flex; gap: 16px; min-height: 0; }
+  #qrPanel { width: 300px; background: linear-gradient(180deg,#1a2340,#10142a); border-radius: 16px; padding: 20px; text-align: center; display: flex; flex-direction: column; align-items: center; justify-content: center; }
+  #qrPanel h2 { margin: 0 0 6px; font-size: 26px; }
+  #qrBox { background: #fff; padding: 10px; border-radius: 12px; margin: 10px 0; }
+  #qrBox canvas, #qrBox img { display: block; }
+  #joinUrl { font-size: 13px; color: #7bed9f; word-break: break-all; }
+  #liveWrap { flex: 1; background: linear-gradient(180deg,#1a2340,#10142a); border-radius: 16px; padding: 16px 20px; overflow: hidden; display: flex; flex-direction: column; }
+  #liveWrap h3, #right h3 { margin: 0 0 8px; }
+  .liveRow { display: flex; align-items: center; gap: 10px; padding: 9px 10px; border-radius: 10px; margin-bottom: 8px; background: rgba(255,255,255,.06); }
+  .prog { flex: 1; height: 14px; background: rgba(255,255,255,.12); border-radius: 7px; overflow: hidden; }
+  .prog > div { height: 100%; background: linear-gradient(90deg,#2ed573,#7bed9f); border-radius: 7px; transition: width .3s; }
+  .liveRow.done .prog > div { background: linear-gradient(90deg,#f9ca24,#f0932b); }
+  .nick { width: 130px; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; font-weight: 700; }
+  .t { width: 76px; text-align: right; font-variant-numeric: tabular-nums; opacity: .9; }
+  #board { flex: 1; overflow-y: auto; margin-top: 8px; }
+  .row { display: flex; align-items: center; gap: 8px; padding: 8px 10px; border-radius: 10px; margin-bottom: 6px; background: rgba(255,255,255,.06); font-size: 15px; }
+  .row.top1 { background: linear-gradient(90deg,#f9ca24,#f0932b); color: #222; font-weight: 800; }
+  .row.top2 { background: linear-gradient(90deg,#c7ecee,#95afc0); color: #222; font-weight: 700; }
+  .row.top3 { background: linear-gradient(90deg,#f8c291,#e58e26); color: #222; font-weight: 700; }
+  .dot { width: 12px; height: 12px; border-radius: 50%; flex-shrink: 0; }
+  .rank { width: 30px; font-weight: 800; }
+  #controls { display: flex; gap: 10px; margin-top: 12px; }
+  #controls button { flex: 1; padding: 13px 0; font-size: 16px; font-weight: 800; border: none; border-radius: 10px; cursor: pointer; }
+  #btnReset { background: #ffa502; } #btnClear { background: #ff4757; color: #fff; }
+  #statusLine { margin-top: 10px; font-size: 13px; opacity: .75; text-align: center; line-height: 1.7; }
+</style>
+</head>
+<body>
+<div id="app">
+  <div id="left">
+    <h1>🏎️ 赛车小游戏 <span style="font-size:15px;opacity:.6">随时加入 · 各跑各的 · 按最快成绩排名</span></h1>
+    <div class="meta" id="metaLine">扫码加入 → 点开始挑战 → 点击按钮加速跑完全程</div>
+    <div id="main">
+      <div id="qrPanel">
+        <h2>微信扫码参加</h2>
+        <div>已加入 <b id="waitCount">0</b> / 50 人</div>
+        <div id="qrBox"><canvas id="qr"></canvas></div>
+        <div id="joinUrl"></div>
+      </div>
+      <div id="liveWrap">
+        <h3>🔴 进行中 <span id="liveCount" style="opacity:.6;font-size:13px"></span></h3>
+        <div id="live"></div>
+      </div>
+    </div>
+  </div>
+  <div id="right">
+    <h3>🏆 总榜（用时最短优先）</h3>
+    <div id="board"></div>
+    <div id="controls">
+      <button id="btnReset">↺ 清空成绩</button>
+      <button id="btnClear">✕ 清空人员</button>
+    </div>
+    <div id="statusLine">无需主持人喊开始，每人随时挑战<br>可重复跑，取个人最快上榜</div>
+  </div>
+</div>
+
+<script>
+const socket = io();
+const $ = id => document.getElementById(id);
+let TRACK = 500;
+
+const joinUrl = location.origin + '/';
+$('joinUrl').textContent = joinUrl;
+QRCode.toCanvas($('qr'), joinUrl, { width: 200, margin: 1 }, () => {});
+
+function fmt(ms) { return ms == null ? '—' : (ms / 1000).toFixed(1) + 's'; }
+function escapeHtml(s) { return String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c])); }
+
+socket.on('board', ({ players, track, count, max }) => {
+  TRACK = track;
+  $('waitCount').textContent = count;
+  $('metaLine').textContent = `扫码加入 → 点开始挑战 → 点击按钮加速跑完 ${TRACK} 米 · ${count}/${max}人`;
+  // 左：进行中的人（进度条直播）
+  const running = players.filter(p => p.status === 'running');
+  $('liveCount').textContent = running.length ? `（${running.length} 人在跑）` : '';
+  $('live').innerHTML = running.slice(0, 10).map(p =>
+    `<div class="liveRow"><span class="nick">${escapeHtml(p.nickname)}</span>
+     <div class="prog"><div style="width:${p.progress}%"></div></div>
+     <span class="t">${p.distance}m</span></div>`
+  ).join('') || '<p style="opacity:.5">暂无人在跑，等观众开始挑战…</p>';
+  // 右：总榜（完赛优先）
+  const done = players.filter(p => p.bestMs != null);
+  $('board').innerHTML = (done.map((p, i) =>
+    `<div class="row ${i===0?'top1':i===1?'top2':i===2?'top3':''}">
+      <span class="rank">${i + 1}</span><span class="dot" style="background:${p.color}"></span>
+      <span class="nick" style="flex:1">${escapeHtml(p.nickname)}</span>
+      <span class="t">${fmt(p.bestMs)}</span>
+    </div>`).join('') || '<p style="opacity:.5">虚位以待，还没有人完赛</p>');
+});
+
+$('btnReset').onclick = () => { if (confirm('清空所有成绩但保留人员？')) socket.emit('host_reset'); };
+$('btnClear').onclick = () => { if (confirm('清空所有人员？')) socket.emit('host_clear'); };
+</script>
+</body>
+</html>

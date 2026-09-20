@@ -1,0 +1,190 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>赛车小游戏 - 个人计时赛</title>
+<script src="/socket.io/socket.io.js"></script>
+<style>
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  body { margin: 0; font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; background: linear-gradient(180deg,#0f2027,#203a43,#2c5364); color: #fff; min-height: 100vh; }
+  .wrap { max-width: 480px; margin: 0 auto; padding: 24px 20px 40px; }
+  h1 { text-align: center; font-size: 26px; margin: 12px 0 4px; }
+  .sub { text-align: center; opacity: .7; font-size: 13px; margin-bottom: 20px; }
+  .card { background: rgba(255,255,255,.1); border-radius: 16px; padding: 20px; backdrop-filter: blur(6px); margin-bottom: 14px; }
+  input { width: 100%; padding: 14px; font-size: 17px; border-radius: 12px; border: none; outline: none; margin: 8px 0 14px; }
+  button { width: 100%; padding: 15px; font-size: 18px; font-weight: 700; border: none; border-radius: 12px; background: #ff4757; color: #fff; cursor: pointer; }
+  button:active { transform: scale(.97); }
+  button.green { background: #2ed573; color: #06281a; }
+  button.secondary { background: rgba(255,255,255,.2); margin-top: 10px; font-size: 15px; }
+  button:disabled { opacity: .5; }
+  .hidden { display: none !important; }
+  .big-time { font-size: 56px; font-weight: 900; text-align: center; font-variant-numeric: tabular-nums; margin: 6px 0; }
+  .bar-outer { height: 26px; background: rgba(255,255,255,.15); border-radius: 13px; overflow: hidden; margin: 12px 0; position: relative; }
+  .bar-inner { height: 100%; width: 0%; background: linear-gradient(90deg,#ffa502,#ff4757); border-radius: 13px; transition: width .15s; }
+  .stat { display: flex; justify-content: space-between; font-size: 15px; margin: 6px 0; }
+  .stat b { font-size: 20px; font-variant-numeric: tabular-nums; }
+  #tapBtn { background: #2ed573; margin-top: 14px; user-select: none; touch-action: manipulation; color: #06281a; padding: 34px 15px; font-size: 22px; }
+  #tapBtn:active { transform: scale(.95); background: #7bed9f; }
+  .tip { font-size: 12px; opacity: .65; text-align: center; margin-top: 12px; line-height: 1.7; }
+  #err { color: #ff6b81; text-align: center; min-height: 20px; font-size: 14px; }
+  #boardList { font-size: 14px; }
+  .brow { display: flex; gap: 8px; padding: 7px 4px; border-bottom: 1px solid rgba(255,255,255,.08); align-items: center; }
+  .brow.me { background: rgba(46,213,115,.15); border-radius: 8px; font-weight: 700; }
+  .btime { margin-left: auto; font-variant-numeric: tabular-nums; opacity: .9; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>🏎️ 赛车小游戏</h1>
+  <div class="sub">扫码即玩 · 随时挑战 · 跑完 <span id="trackLbl">500</span> 米按用时排名</div>
+
+  <!-- 加入 -->
+  <div id="joinView" class="card">
+    <label>取个昵称（大屏会显示）：</label>
+    <input id="nickname" maxlength="10" placeholder="例如：秋名山车神">
+    <div id="err"></div>
+    <button id="joinBtn">加入比赛</button>
+    <div class="tip">输入昵称后加入<br>大屏会实时显示你的成绩</div>
+  </div>
+
+  <!-- 挑战 -->
+  <div id="playView" class="card hidden">
+    <div class="big-time" id="timer">0.0s</div>
+    <div class="stat"><span>进度</span><b id="myDist">0 m</b></div>
+    <div class="bar-outer"><div id="speedBar" class="bar-inner"></div></div>
+    <div class="stat"><span>我的最快</span><b id="myBest">—</b></div>
+    <div class="stat"><span>挑战次数</span><b id="myAttempts">0</b></div>
+    <button id="startBtn" class="green">🏁 开始挑战</button>
+    <button id="tapBtn" class="hidden">👆 快速点击按钮加速</button>
+    <div class="tip">先点“开始挑战”，秒表开始计时<br>再快速点击上方绿色按钮加速，跑完全程自动结算</div>
+  </div>
+
+  <!-- 我的完赛 -->
+  <div id="resultView" class="card hidden">
+    <div class="big-time" id="resultTime">--</div>
+    <div class="sub" id="resultSub"></div>
+    <button class="green" id="retryBtn">🔁 再跑一次（刷更快）</button>
+  </div>
+
+  <!-- 榜单 -->
+  <div id="boardCard" class="card hidden">
+    <div class="stat"><span>🏆 全场榜（最快优先）</span><span id="boardCount"></span></div>
+    <div id="boardList"></div>
+  </div>
+</div>
+
+<script>
+const socket = io();
+const $ = id => document.getElementById(id);
+let myId = null, myNickname = '', running = false, startT = 0, timerInt = null;
+let clickCount = 0, TRACK = 500, attempts = 0;
+let finishLockUntil = 0, swapTimer = null; // 冲线后锁定重开，防止连点误触
+
+function fmt(ms) {
+  if (ms == null) return '—';
+  return (ms / 1000).toFixed(1) + 's';
+}
+
+$('joinBtn').onclick = () => {
+  myNickname = $('nickname').value.trim() || ('车手' + Math.floor(Math.random() * 900 + 100));
+  socket.emit('join', { nickname: myNickname });
+};
+
+socket.on('joined', ({ id, nickname, bestMs, track }) => {
+  myId = id; myNickname = nickname; TRACK = track || 500;
+  $('trackLbl').textContent = TRACK;
+  $('joinView').classList.add('hidden');
+  $('playView').classList.remove('hidden');
+  $('boardCard').classList.remove('hidden');
+  if (bestMs) $('myBest').textContent = fmt(bestMs);
+  if (navigator.vibrate) navigator.vibrate(80);
+});
+socket.on('join_error', ({ msg }) => { $('err').textContent = msg; });
+
+// ===== 点击加速：每200ms把点击次数上报一次 =====
+setInterval(() => {
+  if (running && clickCount > 0) {
+    socket.emit('shake_tick', { count: clickCount });
+  }
+  clickCount = 0;
+}, 200);
+$('tapBtn').addEventListener('pointerdown', () => {
+  clickCount += 3; // 每次点击算3次加速，点得越快跑得越快
+  if (navigator.vibrate) navigator.vibrate(15);
+});
+
+// ===== 个人挑战流程 =====
+$('startBtn').onclick = () => {
+  if (Date.now() < finishLockUntil) return; // 冲线后2秒内禁止重开
+  socket.emit('start_run');
+};
+$('retryBtn').onclick = () => {
+  if (Date.now() < finishLockUntil) return; // 防止结算页刚弹出就被连点击中
+  $('resultView').classList.add('hidden');
+  socket.emit('start_run');
+};
+
+socket.on('run_started', ({ startedAt, track, attempts: a }) => {
+  running = true; startT = startedAt; attempts = a;
+  TRACK = track;
+  $('myAttempts').textContent = attempts;
+  $('resultView').classList.add('hidden');
+  $('startBtn').classList.add('hidden');
+  $('tapBtn').classList.remove('hidden');
+  $('tapBtn').textContent = '👆 快速点击按钮加速';
+  clearInterval(timerInt);
+  timerInt = setInterval(() => { $('timer').textContent = ((Date.now() - startT) / 1000).toFixed(1) + 's'; }, 100);
+  if (navigator.vibrate) navigator.vibrate(80);
+});
+
+socket.on('run_progress', ({ distance, progress, elapsedMs }) => {
+  $('myDist').textContent = distance + ' m / ' + TRACK + ' m';
+  $('speedBar').style.width = progress + '%';
+  $('timer').textContent = (elapsedMs / 1000).toFixed(1) + 's';
+});
+
+socket.on('run_finished', ({ elapsedMs, bestMs, rank }) => {
+  running = false;
+  clearInterval(timerInt);
+  clickCount = 0;
+  finishLockUntil = Date.now() + 2000; // 锁定2秒，手指连点不会直接开下一局
+  clearTimeout(swapTimer);
+  // 关键：加速按钮原地保留2秒再切换，手指落点还在加速区不会点中“开始/再跑”
+  $('timer').textContent = fmt(elapsedMs);
+  $('myBest').textContent = fmt(bestMs) + '（全场第 ' + rank + '）';
+  $('speedBar').style.width = '100%';
+  $('resultTime').textContent = fmt(elapsedMs);
+  $('resultSub').textContent = myNickname + ' · 个人最快 ' + fmt(bestMs) + ' · 全场第 ' + rank + ' 名';
+  swapTimer = setTimeout(() => {
+    $('startBtn').classList.remove('hidden');
+    $('startBtn').textContent = '🏁 开始挑战';
+    $('tapBtn').classList.add('hidden');
+    $('resultView').classList.remove('hidden');
+  }, 1500);
+  if (navigator.vibrate) navigator.vibrate([100, 50, 100]);
+});
+
+socket.on('board', ({ players, count, max }) => {
+  $('boardCount').textContent = count + '/' + max + '人';
+  const done = players.filter(p => p.bestMs != null);
+  $('boardList').innerHTML = (done.slice(0, 20).map((p, i) =>
+    `<div class="brow ${p.id === myId ? 'me' : ''}">${['🥇','🥈','🥉'][i] || (i + 1)} ${escapeHtml(p.nickname)}<span class="btime">${fmt(p.bestMs)}</span></div>`
+  ).join('') || '<div class="tip">还没有人完赛，快来当第一个！</div>');
+});
+
+socket.on('event_reset', () => {
+  running = false; clearInterval(timerInt); clearTimeout(swapTimer);
+  finishLockUntil = 0;
+  $('timer').textContent = '0.0s'; $('myDist').textContent = '0 m';
+  $('speedBar').style.width = '0%'; $('myBest').textContent = '—'; $('myAttempts').textContent = '0';
+  $('resultView').classList.add('hidden');
+  $('startBtn').classList.remove('hidden');
+  $('startBtn').textContent = '🏁 开始挑战';
+  $('tapBtn').classList.add('hidden');
+});
+
+function escapeHtml(s) { return String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c])); }
+</script>
+</body>
+</html>
