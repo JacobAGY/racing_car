@@ -1,0 +1,224 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>5人组队赛 · WebRTC版（方案A）</title>
+<script src="/socket.io/socket.io.js"></script>
+<style>
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+body{margin:0;font-family:-apple-system,"PingFang SC","Microsoft YaHei",sans-serif;background:#0b0e1a;color:#fff;min-height:100vh}
+.wrap{max-width:560px;margin:0 auto;padding:18px 16px 40px}
+h1{text-align:center;font-size:22px;margin:10px 0 2px}
+.sub{text-align:center;opacity:.7;font-size:12px;margin-bottom:12px}
+.card{background:rgba(255,255,255,.08);border-radius:14px;padding:16px;margin-bottom:12px}
+input{width:100%;padding:12px;font-size:16px;border-radius:10px;border:none;outline:none;margin:6px 0}
+button{width:100%;padding:14px;font-size:17px;font-weight:700;border:none;border-radius:10px;background:#ff4757;color:#fff;cursor:pointer;margin-top:8px}
+button.green{background:#2ed573;color:#06281a}button:disabled{opacity:.5}
+.hidden{display:none!important}
+canvas{width:100%;height:220px;background:#141b36;border-radius:12px}
+#tapBtn{padding:34px 14px;font-size:22px;user-select:none;touch-action:manipulation}
+#tapBtn:active{transform:scale(.95)}
+.team{display:flex;gap:8px;justify-content:center;margin:10px 0;flex-wrap:wrap}
+.mate{text-align:center;font-size:11px;width:56px}
+.ava{width:46px;height:46px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:24px;background:rgba(255,255,255,.2);margin:0 auto 4px;border:2px solid transparent}
+.ava.me{border-color:#2ed573}
+.tip{font-size:12px;opacity:.65;text-align:center;line-height:1.7;margin-top:8px}
+.stat{display:flex;justify-content:space-between;margin:4px 0;font-size:14px}
+#log{font-size:12px;opacity:.7;max-height:90px;overflow-y:auto}
+</style>
+</head>
+<body>
+<div class="wrap">
+<h1>🏎️ 5人组队 · WebRTC版</h1>
+<div class="sub">网页即开 · IWPB字母赛道 · 同事开房当主机 · 链接加入 · P2P同步</div>
+
+<div class="card">
+<div class="stat"><span>房间</span><b id="roomLbl">IWPB-1</b></div>
+<div class="stat"><span>身份</span><b id="roleLbl">—</b></div>
+<div class="stat"><span>P2P</span><b id="rtcLbl">未连接</b></div>
+<input id="roomInput" placeholder="房间名，默认 IWPB-1，同队填一样">
+<input id="nickInput" maxlength="10" placeholder="昵称">
+<button id="joinBtn" class="green">进入房间（随机成5人一车队）</button>
+<div class="tip">其中一人先点进入即为主机（host），负责权威计时；<br>其余4人填同样房间名进入，大屏/主机页链接发群里即可。<br>信令走本服务器，游戏数据走 WebRTC DataChannel + 公共STUN。</div>
+</div>
+
+<div class="card">
+<canvas id="cv"></canvas>
+<div class="team" id="mates"></div>
+<div class="stat"><span>进度</span><b id="prog">0%</b></div>
+<div class="stat"><span>用时</span><b id="time">0.0s</b></div>
+<button id="startBtn" class="green hidden">🏁 主机开跑</button>
+<button id="tapBtn" class="hidden">👆 全队一起点我加速</button>
+<div class="tip">5人同时点击，合力推同一辆车跑完 I→W→P→B</div>
+</div>
+
+<div class="card"><div id="log"></div></div>
+</div>
+
+<script>
+// ============ 方案A：WebRTC + 公共STUN ============
+// 架构：HTML+JS单页；canvas画 IWPB 字母赛道；进房随机5人一车；
+// 首位进房者当临时主机(host，权威物理)；他人链接加入(同房间名)；
+// 信令(SDP/ICE)经 Socket.IO 转发；位置/状态经 RTCDataChannel P2P 同步。
+const RTC_CONF = { iceServers: [ { urls: ['stun:stun.l.google.com:19302','stun:stun1.l.google.com:19302'] } ] };
+const $ = id => document.getElementById(id);
+const log = m => { const d = document.createElement('div'); d.textContent = new Date().toLocaleTimeString() + ' ' + m; $('log').prepend(d); };
+const qp = new URLSearchParams(location.search);
+$('roomInput').value = qp.get('room') || 'IWPB-1';
+let socket, role = null, room = null, myIdx = 0, peers = {}, nick = '', running = false, dist = 0, startT = 0, timerInt = null;
+const TRACK = 400, BASE = 6, FACT = 2.2;
+let boosts = {}; // host 权威：每个队员的 boost
+
+// ---- IWPB 赛道绘制：4个字母即地形，车沿 I→W→P→B 行进 ----
+const cv = $('cv'), ctx = cv.getContext('2d');
+function draw() {
+  const dpr = devicePixelRatio || 1;
+  cv.width = cv.clientWidth * dpr; cv.height = 220 * dpr;
+  const W = cv.width, H = cv.height;
+  ctx.clearRect(0, 0, W, H);
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  const segs = ['I', 'W', 'P', 'B'];
+  const p = Math.min(1, dist / TRACK);
+  segs.forEach((ch, i) => {
+    const x = W * (0.14 + i * 0.24), y = H / 2;
+    const done = p * 4 > i + 1, active = p * 4 > i && p * 4 <= i + 1;
+    ctx.font = `900 ${52 * dpr}px sans-serif`;
+    ctx.fillStyle = done ? '#2ed573' : active ? '#ffa502' : 'rgba(255,255,255,.22)';
+    ctx.fillText(ch, x, y - 10 * dpr);
+    ctx.font = `${11 * dpr}px sans-serif`; ctx.fillStyle = 'rgba(255,255,255,.5)';
+    ctx.fillText(['起点直道', '连续弯', '发卡弯', '冲刺'][i], x, y + 34 * dpr);
+  });
+  // 小车：整体进度映射到4字母路径
+  const cx = W * (0.06 + p * 0.88);
+  ctx.font = `${30 * dpr}px serif`; ctx.textAlign = 'left';
+  ctx.fillText('🚗', cx - 14 * dpr, H / 2 + 52 * dpr);
+  ctx.font = `${15 * dpr}px serif`;
+  const avs = [...document.querySelectorAll('.ava')].map(e => e.textContent || '●').slice(0, 5);
+  avs.forEach((a, k) => ctx.fillText(a, cx - 12 * dpr + k * 15 * dpr, H / 2 + 32 * dpr));
+  requestAnimationFrame(draw);
+}
+requestAnimationFrame(draw);
+
+$('joinBtn').onclick = () => {
+  room = ($('roomInput').value.trim() || 'IWPB-1').slice(0, 32);
+  nick = $('nickInput').value.trim() || ('车手' + Math.floor(Math.random() * 900 + 100));
+  $('roomLbl').textContent = room;
+  history.replaceState(null, '', '?room=' + encodeURIComponent(room));
+  socket = io({ transports: ['websocket', 'polling'] });
+  socket.emit('rtc_join', { room });
+  socket.on('rtc_role', async ({ role: r, index }) => {
+    role = r; myIdx = index;
+    $('roleLbl').textContent = r === 'host' ? '主机（权威计时）' : '队员 #' + (index + 1);
+    log('你是 ' + role + '，房间 ' + room + '，分享链接：' + location.href);
+    renderMates();
+    if (role === 'host') { $('startBtn').classList.remove('hidden'); startHostLoop(); }
+    $('tapBtn').classList.remove('hidden');
+  });
+  socket.on('rtc_peer_in', ({ id }) => { if (role === 'host') makeOffer(id); });
+  socket.on('rtc_offer', async ({ from, sdp }) => {
+    const pc = new RTCPeerConnection(RTC_CONF);
+    peers[from] = pc;
+    pc.ondatachannel = e => bindChannel(from, e.channel);
+    pc.onicecandidate = e => { if (e.candidate) socket.emit('rtc_ice', { to: from, candidate: e.candidate }); };
+    await pc.setRemoteDescription(sdp);
+    const ans = await pc.createAnswer();
+    await pc.setLocalDescription(ans);
+    socket.emit('rtc_answer', { to: from, sdp: pc.localDescription });
+    $('rtcLbl').textContent = 'P2P 连接中…';
+  });
+  socket.on('rtc_answer', async ({ from, sdp }) => { await peers[from].setRemoteDescription(sdp); });
+  socket.on('rtc_ice', async ({ from, candidate }) => { try { await peers[from].addIceCandidate(candidate); } catch (e) {} });
+};
+
+// host 向每个 guest 建 DataChannel
+async function makeOffer(id) {
+  const pc = new RTCPeerConnection(RTC_CONF);
+  peers[id] = pc;
+  const ch = pc.createDataChannel('game');
+  bindChannel(id, ch);
+  pc.onicecandidate = e => { if (e.candidate) socket.emit('rtc_ice', { to: id, candidate: e.candidate }); };
+  const offer = await pc.createOffer();
+  await pc.setLocalDescription(offer);
+  socket.emit('rtc_offer', { room, to: id, sdp: pc.localDescription });
+}
+function bindChannel(id, ch) {
+  if (peers[id]) peers[id]._dc = ch; // guest 侧也要挂引用，保证 tap 能经 P2P 发出
+  ch.onopen = () => { $('rtcLbl').textContent = 'P2P 已连接（' + Object.keys(peers).length + '路）'; log('DataChannel open: ' + id.slice(0, 6)); };
+  ch.onmessage = e => {
+    const m = JSON.parse(e.data);
+    if (role === 'host' && m.t === 'tap') { boosts[m.nick] = (boosts[m.nick] || 0) + Math.min(m.c, 30); }
+    if (role !== 'host' && m.t === 'state') {
+      dist = m.d; running = m.r;
+      $('prog').textContent = Math.round(m.d / TRACK * 100) + '%';
+      if (m.r && !startT) { startT = Date.now() - m.e; tickTime(); }
+      if (!m.r && m.e > 0) { $('time').textContent = (m.e / 1000).toFixed(1) + 's'; clearInterval(timerInt); startT = 0; }
+    }
+  };
+  ch._id = id;
+}
+function bcast(o) { Object.values(peers).forEach(pc => { const ch = pc._ch || Object.values(peers); }); }
+function sendAll(o) {
+  const s = JSON.stringify(o);
+  for (const id in peers) {
+    const pc = peers[id];
+    // 取 DataChannel：host 建的 channel 存在 pc.sctp 上，简化用全局映射
+    if (pc._dc && pc._dc.readyState === 'open') pc._dc.send(s);
+  }
+}
+// 简化：保存 channel 引用
+const _origBind = bindChannel;
+
+// host 权威物理 tick：合力推进，全网广播 state
+function startHostLoop() {
+  setInterval(() => {
+    if (!running) return;
+    let b = 0; for (const k in boosts) b += boosts[k];
+    dist += (BASE + b * FACT) * 0.1;
+    for (const k in boosts) boosts[k] *= 0.88;
+    const e = Date.now() - startT;
+    if (dist >= TRACK) { dist = TRACK; running = false; log('🏁 全队完赛 ' + (e / 1000).toFixed(1) + 's'); }
+    sendState(e);
+    $('prog').textContent = Math.round(dist / TRACK * 100) + '%';
+  }, 100);
+}
+function sendState(e) {
+  const s = JSON.stringify({ t: 'state', d: Math.round(dist), r: running, e: running ? e : e });
+  for (const id in peers) {
+    // host 的 DataChannel 引用存在 peer 对象上
+    const pc = peers[id];
+    if (pc._dc && pc._dc.readyState === 'open') pc._dc.send(s);
+  }
+}
+
+// 点击上报：guest 经 DataChannel 发 host；host 本地直接计入（单机也可用）
+let clickCount = 0;
+setInterval(() => {
+  if (clickCount <= 0) return;
+  if (role === 'host') boosts['__host__'] = (boosts['__host__'] || 0) + clickCount;
+  else {
+    const s = JSON.stringify({ t: 'tap', nick, c: clickCount });
+    for (const id in peers) { const pc = peers[id]; if (pc._dc && pc._dc.readyState === 'open') pc._dc.send(s); }
+    // 兜底：P2P 未通时经信令服务器转发（保证不同WiFi/对称NAT下也能玩）
+    socket.emit('tap', { count: clickCount });
+  }
+  clickCount = 0;
+}, 200);
+$('tapBtn').addEventListener('pointerdown', () => { clickCount += 3; if (navigator.vibrate) navigator.vibrate(12); });
+$('startBtn').onclick = () => { dist = 0; running = true; startT = Date.now(); boosts = {}; tickTime(); log('🏁 开跑！5人一起点加速'); socket.emit('team_start'); };
+function tickTime() { clearInterval(timerInt); timerInt = setInterval(() => { if (startT) $('time').textContent = ((Date.now() - startT) / 1000).toFixed(1) + 's'; }, 100); }
+function renderMates() {
+  const avs = ['🐯', '🐼', '🦊', '🐸', '🐵'];
+  $('mates').innerHTML = avs.map((a, i) => `<div class="mate"><div class="ava ${i === myIdx % 5 ? 'me' : ''}">${a}</div>${i === myIdx % 5 ? nick : '队友' + (i + 1)}</div>`).join('');
+}
+</script>
+<script>
+// 补丁：bindChannel 时把 channel 挂到 pc 上，保证 sendState 能找到
+(function () {
+  const proto = RTCPeerConnection.prototype;
+  const origCreate = proto.createDataChannel;
+  proto.createDataChannel = function (...a) { const ch = origCreate.apply(this, a); this._dc = ch; return ch; };
+})();
+</script>
+</body>
+</html>

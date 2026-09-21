@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: racing-team-server
+    env: docker
+    plan: free
+    healthCheckPath: /health
+    envVars:
+      - key: TEAM_SIZE
+        value: 5
+      - key: TRACK_LENGTH
+        value: 400
